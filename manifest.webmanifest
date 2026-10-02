@@ -1,0 +1,20 @@
+{
+  "id": "./",
+  "name": "Music Dial",
+  "short_name": "Music Dial",
+  "description": "악보와 연주를 한곳에 모으는 음악 라이브러리",
+  "lang": "ko",
+  "start_url": "./index.html#explore",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#edf8f2",
+  "theme_color": "#edf8f2",
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

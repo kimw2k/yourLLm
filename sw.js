@@ -3,7 +3,7 @@
 const PREFIX =
   "music-dial-shell:" + encodeURIComponent(self.registration.scope) + ":";
 
-const CACHE = PREFIX + "v2";
+const CACHE = PREFIX + "v3";
 
 const FILES = [
   "./index.html",

@@ -2464,7 +2464,7 @@ route();
         flushParagraph();
         closeList();
         root.append(
-          el(`h${heading[1].length}`, "", heading[1])
+          el(`h${heading[1].length}`, "", heading[2])
         );
         continue;
       }
@@ -2659,6 +2659,827 @@ route();
    * 확장 검증기가 준비된 이후 저장 기록을 다시 읽습니다.
    * 저장 기록을 삭제하거나 기본값으로 덮어쓰지 않습니다.
    */
+  load();
+  route();
+})();
+</script>
+<script id="music-dial-v3">
+(() => {
+  "use strict";
+
+  if (window.__musicDialV3Installed) return;
+  if (
+    typeof KIND === "undefined" ||
+    typeof validate !== "function" ||
+    typeof checkFile !== "function" ||
+    !$("f-kind") ||
+    !document.querySelector("#dial .music-orbit")
+  ) {
+    console.error("Music Dial V2가 먼저 필요합니다.");
+    return;
+  }
+  window.__musicDialV3Installed = true;
+
+  /* ──────────────────────────────────────────
+     1. 화면 스타일
+     ────────────────────────────────────────── */
+
+  const css = document.createElement("style");
+  css.textContent = `
+    .v3-search-panel {
+      display:grid; gap:8px; margin:12px 0 18px;
+      min-width:0;
+    }
+    .v3-kind-label {
+      display:flex; align-items:center; gap:12px;
+      font-size:.85rem; color:var(--muted);
+    }
+    .v3-kind-label select {
+      flex:1; min-width:0; min-height:46px;
+      padding:10px 12px; border:1px solid var(--line);
+      border-radius:14px; background:var(--surface);
+      color:var(--ink); font:inherit;
+    }
+    .v3-search-details {
+      border:1px solid var(--line);
+      border-radius:14px; background:var(--surface);
+    }
+    .v3-search-details summary {
+      min-height:44px; padding:10px 14px;
+      cursor:pointer; font-size:.85rem;
+      color:var(--muted); overflow-wrap:anywhere;
+    }
+    .v3-search-details search { padding:0 10px 10px; }
+    .v3-search-details .search { background:var(--bg); }
+    .v3-sound-shortcut {
+      display:flex; justify-content:center; margin-top:12px;
+    }
+    .v3-sound-shortcut button {
+      font-size:.8rem; border-radius:999px;
+    }
+    .v3-sound-shortcut button[aria-pressed="true"] {
+      background:var(--soft); color:var(--accent);
+    }
+    .v3-volume {
+      display:flex; align-items:center; gap:12px;
+      margin:16px 0;
+    }
+    .v3-volume input {
+      flex:1; min-width:0; min-height:44px;
+      accent-color:var(--accent);
+    }
+    .v3-volume output {
+      min-width:42px; font-size:.85rem;
+      color:var(--muted); text-align:end;
+    }
+    .v3-html-preview {
+      display:block; width:100%; height:65dvh;
+      min-height:260px; border:1px solid var(--line);
+      border-radius:14px; background:#fff;
+      color-scheme:light;
+    }
+    .v3-html-source {
+      margin:0; padding:16px; max-height:65dvh;
+      overflow:auto; white-space:pre-wrap;
+      overflow-wrap:anywhere; tab-size:4;
+      border:1px solid var(--line);
+      border-radius:14px; background:var(--bg);
+      font:.85rem/1.8 ui-monospace,Consolas,monospace;
+    }
+  `;
+  document.head.append(css);
+
+  /* ──────────────────────────────────────────
+     2. HTML 종류 및 효과음 설정 스키마
+     기존 JSON도 허용하고, 저장 시 새 설정을 포함
+     ────────────────────────────────────────── */
+
+  KIND.html = "HTML 문서";
+
+  const htmlOption = document.createElement("option");
+  htmlOption.value = "html";
+  htmlOption.textContent = "HTML 문서";
+  $("f-kind").append(htmlOption);
+
+  const defaultSound = () => ({ enabled:false, volume:20 });
+
+  const previousDefaults = defaults;
+  defaults = function() {
+    return { ...previousDefaults(), sound:defaultSound() };
+  };
+
+  const previousValidate = validate;
+
+  validate = function(input) {
+    const candidate = copy(input);
+
+    if (
+      !candidate ||
+      typeof candidate !== "object" ||
+      Array.isArray(candidate)
+    ) {
+      return previousValidate(input);
+    }
+
+    const sound = Object.hasOwn(candidate, "sound")
+      ? candidate.sound
+      : defaultSound();
+
+    exact(sound, ["enabled", "volume"]);
+
+    if (
+      typeof sound.enabled !== "boolean" ||
+      !Number.isInteger(sound.volume) ||
+      sound.volume < 0 ||
+      sound.volume > 100
+    ) {
+      throw Error("효과음 설정 형식이 올바르지 않습니다.");
+    }
+
+    delete candidate.sound;
+
+    /*
+     * V2 검증기의 기존 파일 자료 검증을 재사용합니다.
+     * HTML은 기기 파일 등록만 허용합니다.
+     */
+    const htmlIndexes = [];
+
+    if (Array.isArray(candidate.items)) {
+      candidate.items.forEach((item, index) => {
+        if (item?.kind !== "html") return;
+
+        if (item.source !== "local") {
+          throw Error("HTML 문서는 기기 파일로 등록하세요.");
+        }
+
+        htmlIndexes.push(index);
+        item.kind = "txt";
+      });
+    }
+
+    const result = previousValidate(candidate);
+
+    htmlIndexes.forEach(index => {
+      result.items[index].kind = "html";
+    });
+
+    result.sound = {
+      enabled:sound.enabled,
+      volume:sound.volume
+    };
+
+    return result;
+  };
+
+  /* ──────────────────────────────────────────
+     3. 파일 검증
+     HTML UTF-8 검사 + V2 JPEG/WebM 식별 오류 보정
+     ────────────────────────────────────────── */
+
+  const previousCheckFile = checkFile;
+  const HTML_LIMIT = 5 * 1024 * 1024;
+
+  function decodeHTML(buffer) {
+    let text;
+
+    try {
+      text = new TextDecoder("utf-8", {
+        fatal:true
+      }).decode(buffer);
+    } catch {
+      throw Error(
+        "HTML을 UTF-8로 저장한 뒤 다시 선택하세요."
+      );
+    }
+
+    if (text.includes("\u0000")) {
+      throw Error("텍스트가 아닌 데이터가 포함되어 있습니다.");
+    }
+
+    return text;
+  }
+
+  checkFile = async function(file, kind) {
+    if (!["html", "image", "video"].includes(kind)) {
+      return previousCheckFile(file, kind);
+    }
+
+    if (!(file instanceof Blob) || !file.size) {
+      throw Error("비어 있거나 읽을 수 없는 파일입니다.");
+    }
+
+    if (kind === "html") {
+      if (file.size > HTML_LIMIT) {
+        throw Error("HTML 문서는 5MiB 이하로 선택하세요.");
+      }
+
+      if (
+        file.name &&
+        !/\.html?$/i.test(file.name)
+      ) {
+        throw Error(".html 또는 .htm 파일을 선택하세요.");
+      }
+
+      decodeHTML(await file.arrayBuffer());
+      return;
+    }
+
+    const max = kind === "image"
+      ? 20 * 1024 * 1024
+      : 256 * 1024 * 1024;
+
+    if (file.size > max) {
+      throw Error(
+        kind === "image"
+          ? "이미지는 20MiB 이하로 선택하세요."
+          : "영상은 256MiB 이하로 선택하세요."
+      );
+    }
+
+    const head = new Uint8Array(
+      await file.slice(0, 32).arrayBuffer()
+    );
+    const ascii = (start, end) =>
+      String.fromCharCode(...head.slice(start, end));
+
+    if (kind === "image") {
+      const jpeg =
+        head[0] === 0xff &&
+        head[1] === 0xd8 &&
+        head[2] === 0xff;
+
+      const png =
+        [137,80,78,71,13,10,26,10].every(
+          (value, index) => head[index] === value
+        );
+
+      const gif =
+        ["GIF87a", "GIF89a"].includes(ascii(0, 6));
+
+      const webp =
+        ascii(0, 4) === "RIFF" &&
+        ascii(8, 12) === "WEBP";
+
+      if (!(jpeg || png || gif || webp)) {
+        throw Error(
+          "JPG·PNG·WebP·GIF 이미지를 선택하세요."
+        );
+      }
+      return;
+    }
+
+    const mp4OrMov = ascii(4, 8) === "ftyp";
+    const webm =
+      head[0] === 0x1a &&
+      head[1] === 0x45 &&
+      head[2] === 0xdf &&
+      head[3] === 0xa3;
+    const ogg = ascii(0, 4) === "OggS";
+
+    if (!(mp4OrMov || webm || ogg)) {
+      throw Error(
+        "영상 컨테이너를 확인할 수 없습니다. MP4 또는 WebM으로 변환해 주세요."
+      );
+    }
+  };
+
+  /* ──────────────────────────────────────────
+     4. HTML 등록 입력창
+     ────────────────────────────────────────── */
+
+  const previousFields = fields;
+
+  fields = function() {
+    previousFields();
+
+    if ($("f-kind").value !== "html") return;
+
+    $("f-source").value = "local";
+    $("source-field").hidden = true;
+    $("url-field").hidden = true;
+    $("file-field").hidden = false;
+    $("text-field").hidden = true;
+
+    $("f-url").required = false;
+    $("f-text").required = false;
+    $("f-file").accept = ".html,.htm,text/html";
+
+    const old = state.items.find(
+      item => item.id === editingId
+    );
+
+    const currentFile =
+      old?.kind === "html"
+        ? `현재: ${old.fileName} · `
+        : "";
+
+    $("file-help").textContent =
+      currentFile + "UTF-8 HTML · 최대 5MiB";
+  };
+
+  $("f-source").onchange = () => fields();
+
+  const previousDrawDetail = drawDetail;
+
+  drawDetail = function() {
+    previousDrawDetail();
+
+    if (current()?.kind === "html") {
+      $("open").textContent = "HTML 문서 보기";
+    }
+  };
+
+  /* ──────────────────────────────────────────
+     5. 드롭다운 + 접이식 키워드 검색
+     ────────────────────────────────────────── */
+
+  const oldFilters = $("filters");
+  oldFilters.hidden = true;
+
+  const searchPanel = el("div", "v3-search-panel");
+  const kindLabel = el("label", "v3-kind-label");
+  const kindSelect = document.createElement("select");
+
+  kindSelect.id = "v3-kind-filter";
+  kindLabel.append(
+    el("span", "", "자료 종류"),
+    kindSelect
+  );
+
+  const searchDetails =
+    el("details", "v3-search-details");
+  const searchSummary =
+    el("summary", "", "키워드 검색");
+
+  searchDetails.append(searchSummary);
+
+  const existingSearch = $("query").closest("search");
+  if (existingSearch) searchDetails.append(existingSearch);
+
+  searchPanel.append(kindLabel, searchDetails);
+  oldFilters.before(searchPanel);
+
+  kindSelect.onchange = () => {
+    filter = kindSelect.value;
+    render();
+  };
+
+  $("query").oninput = () => render();
+
+  let kindSignature = "";
+
+  function syncSearch() {
+    const entries = [
+      ["all", "전체 자료"],
+      ...Object.entries(KIND)
+    ];
+    const signature = JSON.stringify(entries);
+
+    if (signature !== kindSignature) {
+      kindSignature = signature;
+
+      kindSelect.replaceChildren(
+        ...entries.map(([value, label]) => {
+          const option = document.createElement("option");
+          option.value = value;
+          option.textContent = label;
+          return option;
+        })
+      );
+    }
+
+    kindSelect.value = filter;
+
+    const query = $("query").value.trim();
+
+    searchSummary.textContent = query
+      ? `키워드: ${query}`
+      : "키워드 검색";
+
+    if (query) {
+      searchSummary.title = query;
+    } else {
+      searchSummary.removeAttribute("title");
+    }
+  }
+
+  /* ──────────────────────────────────────────
+     6. Web Audio API 효과음
+     외부 음원 파일·네트워크 요청 없음
+     ────────────────────────────────────────── */
+
+  const AudioContextClass =
+    window.AudioContext || window.webkitAudioContext;
+
+  let audioContext = null;
+  let lastToneTime = -Infinity;
+
+  const soundPrefs = () => state.sound || defaultSound();
+
+  async function armAudio() {
+    if (!AudioContextClass || !soundPrefs().enabled) return;
+
+    if (!audioContext || audioContext.state === "closed") {
+      audioContext = new AudioContextClass();
+    }
+
+    if (audioContext.state === "suspended") {
+      await audioContext.resume();
+    }
+  }
+
+  function tick() {
+    const prefs = soundPrefs();
+    const now = performance.now();
+
+    if (
+      !prefs.enabled ||
+      prefs.volume === 0 ||
+      !audioContext ||
+      audioContext.state !== "running" ||
+      document.hidden ||
+      $("viewer").open ||
+      now - lastToneTime < 65
+    ) return;
+
+    lastToneTime = now;
+
+    const oscillator = audioContext.createOscillator();
+    const gain = audioContext.createGain();
+    const t = audioContext.currentTime;
+    const level = 0.045 * prefs.volume / 100;
+
+    oscillator.type = "sine";
+    oscillator.frequency.setValueAtTime(1350, t);
+    oscillator.frequency.exponentialRampToValueAtTime(
+      700, t + 0.025
+    );
+
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(
+      Math.max(0.0002, level), t + 0.002
+    );
+    gain.gain.exponentialRampToValueAtTime(
+      0.0001, t + 0.028
+    );
+
+    oscillator.connect(gain);
+    gain.connect(audioContext.destination);
+
+    oscillator.onended = () => {
+      oscillator.disconnect();
+      gain.disconnect();
+    };
+
+    oscillator.start(t);
+    oscillator.stop(t + 0.032);
+  }
+
+  function saveSound(patch) {
+    return change(next => {
+      next.sound = { ...soundPrefs(), ...patch };
+    });
+  }
+
+  async function toggleSound() {
+    const enabled = !soundPrefs().enabled;
+    if (!saveSound({ enabled })) return;
+
+    if (enabled) {
+      try {
+        await armAudio();
+        tick();
+      } catch {
+        toast("소리를 시작하지 못했습니다. 다시 눌러 주세요.");
+      }
+    }
+  }
+
+  const shortcut = el("div", "v3-sound-shortcut");
+  const soundButton = button("효과음 끔", toggleSound);
+  shortcut.append(soundButton);
+  document.querySelector(".dial-controls").after(shortcut);
+
+  const soundPanel = el("section", "panel");
+  soundPanel.append(el("h2", "", "다이얼 효과음"));
+
+  const soundToggle = button("효과음 켜기", toggleSound);
+  const soundTest = button("소리 확인", async () => {
+    if (!soundPrefs().enabled) {
+      toast("효과음을 먼저 켜 주세요.");
+      return;
+    }
+    try {
+      await armAudio();
+      tick();
+    } catch {
+      toast("이 브라우저에서 소리를 시작하지 못했습니다.");
+    }
+  });
+
+  const soundActions = el("div", "actions");
+  soundActions.append(soundToggle, soundTest);
+
+  const volumeRow = el("label", "v3-volume");
+  const volumeInput = document.createElement("input");
+  const volumeOutput = document.createElement("output");
+
+  volumeInput.type = "range";
+  volumeInput.min = "0";
+  volumeInput.max = "100";
+  volumeInput.step = "5";
+  volumeInput.setAttribute("aria-label", "다이얼 효과음 음량");
+
+  volumeInput.oninput = () => {
+    volumeOutput.textContent = volumeInput.value + "%";
+  };
+  volumeInput.onchange = () => {
+    saveSound({ volume:Number(volumeInput.value) });
+  };
+
+  volumeRow.append(
+    el("span", "", "음량"),
+    volumeInput,
+    volumeOutput
+  );
+
+  soundPanel.append(
+    soundActions,
+    volumeRow,
+    el(
+      "p", "",
+      "기본은 꺼짐입니다. 첫 터치 이후 동작하며, 자료 재생창에서는 소리가 나지 않습니다."
+    )
+  );
+
+  $("settings").append(soundPanel);
+
+  function syncSound() {
+    const prefs = soundPrefs();
+    const unavailable = !AudioContextClass || blocked;
+
+    soundButton.textContent =
+      prefs.enabled ? "효과음 켜짐" : "효과음 끔";
+
+    soundToggle.textContent =
+      prefs.enabled ? "효과음 끄기" : "효과음 켜기";
+
+    for (const button of [soundButton, soundToggle]) {
+      button.setAttribute(
+        "aria-pressed", String(prefs.enabled)
+      );
+      button.disabled = unavailable;
+    }
+
+    soundTest.disabled = unavailable;
+    volumeInput.disabled = unavailable;
+    volumeInput.value = String(prefs.volume);
+    volumeOutput.textContent = prefs.volume + "%";
+  }
+
+  /*
+   * 클릭·키보드 선택이 바뀌었을 때 효과음.
+   * 초기 렌더링과 검색 필터 변경에는 소리를 내지 않습니다.
+   */
+  const previousSelect = select;
+
+  select = function(id, ...args) {
+    const changed = id !== selectedId;
+    previousSelect(id, ...args);
+    if (changed) tick();
+  };
+
+  const dial = $("dial");
+  const orbit = dial.querySelector(".music-orbit");
+
+  let activePointer = null;
+  let previousSector = null;
+
+  function currentSector() {
+    const matched = orbit?.style.transform.match(
+      /rotate\(\s*([-+\d.e]+)deg\s*\)/i
+    );
+    const degrees = matched ? Number(matched[1]) : 0;
+    const count = orbit?.querySelectorAll(".node").length || 1;
+    return Math.round(degrees / (360 / count));
+  }
+
+  dial.addEventListener("pointerdown", event => {
+    if (event.button !== 0 || event.isPrimary === false) return;
+    activePointer = event.pointerId;
+    previousSector = currentSector();
+    armAudio().catch(() => {});
+  }, true);
+
+  function releaseSoundPointer(event) {
+    if (event.pointerId === activePointer) {
+      activePointer = null;
+      previousSector = null;
+    }
+  }
+
+  dial.addEventListener("pointerup", releaseSoundPointer, true);
+  dial.addEventListener("pointercancel", releaseSoundPointer, true);
+  dial.addEventListener(
+    "lostpointercapture", releaseSoundPointer, true
+  );
+
+  /*
+   * V2의 회전 애니메이션은 그대로 유지합니다.
+   * 손으로 회전 중 항목 경계를 지날 때만 추가 효과음을 냅니다.
+   */
+  if (orbit) {
+    new MutationObserver(() => {
+      if (activePointer === null) return;
+
+      const sector = currentSector();
+      if (sector !== previousSector) {
+        previousSector = sector;
+        tick();
+      }
+    }).observe(orbit, {
+      attributes:true,
+      attributeFilter:["style"]
+    });
+  }
+
+  for (const node of [dial, $("prev"), $("next")]) {
+    node.addEventListener("pointerdown", () => {
+      armAudio().catch(() => {});
+    }, true);
+
+    node.addEventListener("keydown", event => {
+      if ([
+        "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown",
+        "Home", "End", "Enter", " "
+      ].includes(event.key)) {
+        armAudio().catch(() => {});
+      }
+    }, true);
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden && audioContext?.state === "running") {
+      audioContext.suspend().catch(() => {});
+    }
+  });
+
+  /* ──────────────────────────────────────────
+     7. 격리된 HTML 문서 미리보기
+     - template 안에서 파싱하여 활성 문서에 원문 삽입 금지
+     - 허용한 태그와 속성만 유지
+     - sandbox에 권한 부여하지 않음
+     - CSP로 스크립트와 외부 요청 차단
+     ────────────────────────────────────────── */
+
+  function isolatedHTML(source) {
+    const template = document.createElement("template");
+    template.innerHTML = source;
+
+    const allowedTags = new Set((
+      "DIV SPAN P BR HR H1 H2 H3 H4 H5 H6 " +
+      "HEADER FOOTER MAIN SECTION ARTICLE ASIDE NAV " +
+      "UL OL LI DL DT DD BLOCKQUOTE PRE CODE " +
+      "STRONG EM B I U S SMALL SUB SUP MARK ABBR " +
+      "TABLE CAPTION THEAD TBODY TFOOT TR TH TD COLGROUP COL " +
+      "FIGURE FIGCAPTION IMG A DETAILS SUMMARY " +
+      "TIME KBD SAMP VAR STYLE"
+    ).split(" "));
+
+    const allowedAttributes = new Set([
+      "class", "id", "style", "title", "lang", "dir",
+      "alt", "width", "height", "colspan", "rowspan",
+      "scope", "open", "start", "reversed", "span",
+      "aria-label", "role"
+    ]);
+
+    for (const node of [...template.content.querySelectorAll("*")]) {
+      if (!allowedTags.has(node.tagName)) {
+        node.remove();
+        continue;
+      }
+
+      for (const attribute of [...node.attributes]) {
+        const name = attribute.name.toLowerCase();
+
+        const embeddedRaster =
+          node.tagName === "IMG" &&
+          name === "src" &&
+          /^data:image\/(?:png|jpeg|gif|webp);base64,/i.test(
+            attribute.value.trim()
+          );
+
+        if (!allowedAttributes.has(name) && !embeddedRaster) {
+          node.removeAttribute(attribute.name);
+        }
+      }
+    }
+
+    const policy = [
+      "default-src 'none'",
+      "script-src 'none'",
+      "style-src 'unsafe-inline'",
+      "img-src data:",
+      "font-src data:",
+      "connect-src 'none'",
+      "frame-src 'none'",
+      "object-src 'none'",
+      "media-src 'none'",
+      "base-uri 'none'",
+      "form-action 'none'"
+    ].join("; ");
+
+    return (
+      '<!doctype html><html><head>' +
+      '<meta charset="utf-8">' +
+      '<meta http-equiv="Content-Security-Policy" content="' +
+      policy + '">' +
+      '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+      '<style>' +
+      'body{margin:0;padding:16px;overflow-wrap:anywhere;' +
+      'font:16px/1.7 system-ui,sans-serif;color:#202c27;background:#fff}' +
+      'img{max-width:100%;height:auto}' +
+      'pre{white-space:pre-wrap;overflow-wrap:anywhere}' +
+      '</style></head><body>' +
+      template.innerHTML +
+      '</body></html>'
+    );
+  }
+
+  const previousOpenItem = openItem;
+
+  openItem = async function(item) {
+    if (item?.kind !== "html") {
+      return previousOpenItem(item);
+    }
+
+    clearViewer();
+    const token = viewerToken;
+
+    $("viewer-title").textContent = item.title;
+    $("viewer").classList.remove("pdf-view");
+    $("viewer-status").textContent = "문서를 읽는 중…";
+    $("viewer").showModal();
+
+    try {
+      const file = await resolveLocal(item);
+      const source = decodeHTML(await file.arrayBuffer());
+
+      if (token !== viewerToken) return;
+
+      const iframe = document.createElement("iframe");
+      iframe.className = "v3-html-preview";
+      iframe.title = item.title + " 격리 미리보기";
+      iframe.setAttribute("sandbox", "");
+      iframe.setAttribute("referrerpolicy", "no-referrer");
+      iframe.srcdoc = isolatedHTML(source);
+
+      const original = el("pre", "v3-html-source", source);
+      original.hidden = true;
+
+      const toolbar = el("div", "extended-toolbar");
+
+      const previewButton = button("미리보기", () => {
+        iframe.hidden = false;
+        original.hidden = true;
+        previewButton.setAttribute("aria-pressed", "true");
+        sourceButton.setAttribute("aria-pressed", "false");
+      });
+
+      const sourceButton = button("원문 보기", () => {
+        iframe.hidden = true;
+        original.hidden = false;
+        previewButton.setAttribute("aria-pressed", "false");
+        sourceButton.setAttribute("aria-pressed", "true");
+      });
+
+      previewButton.setAttribute("aria-pressed", "true");
+      sourceButton.setAttribute("aria-pressed", "false");
+
+      toolbar.append(previewButton, sourceButton);
+      $("viewer-body").append(toolbar, iframe, original);
+
+      $("viewer-status").textContent =
+        "격리된 문서 미리보기입니다. 스크립트·외부 연결·링크 이동은 차단되며, 일부 요소는 생략됩니다.";
+    } catch (error) {
+      if (token !== viewerToken) return;
+      $("viewer-status").textContent =
+        error.message || "HTML 문서를 읽지 못했습니다.";
+    }
+  };
+
+  /* ──────────────────────────────────────────
+     8. 새 UI 동기화 및 기존 저장 기록 다시 읽기
+     ────────────────────────────────────────── */
+
+  const previousRender = render;
+
+  render = function() {
+    previousRender();
+    syncSearch();
+    syncSound();
+  };
+
   load();
   route();
 })();

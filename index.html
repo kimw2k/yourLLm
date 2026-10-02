@@ -1450,5 +1450,1219 @@ if ("serviceWorker" in navigator &&
 load();
 route();
 </script>
+<script>
+/*
+ * Music Dial — 회전 복구 및 자료 형식 확장
+ * 기존 Music Dial 스크립트 다음, </body> 직전에 배치합니다.
+ */
+(() => {
+  "use strict";
+
+  if (
+    !document.getElementById("f-kind") ||
+    typeof KIND === "undefined" ||
+    typeof openItem !== "function"
+  ) {
+    console.error("이 패치는 Music Dial 버전에 적용해야 합니다.");
+    return;
+  }
+
+  /* =========================================================
+     1. 확장 화면 스타일
+     ========================================================= */
+
+  const style = document.createElement("style");
+  style.textContent = `
+    #dial {
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+      cursor: grab;
+    }
+    #dial.is-dragging { cursor: grabbing; }
+
+    .music-orbit {
+      position: absolute;
+      inset: 0;
+      border-radius: 50%;
+      will-change: transform;
+    }
+    .music-orbit .node {
+      z-index: 2;
+      touch-action: none;
+    }
+    .music-orbit .dial-glyph {
+      display: grid;
+      place-items: center;
+      pointer-events: none;
+      will-change: transform;
+    }
+    .music-orbit .dial-glyph .icon {
+      width: 28px;
+      height: 28px;
+    }
+
+    .extended-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+    .extended-toolbar button {
+      min-width: 44px;
+      min-height: 44px;
+    }
+    .extended-toolbar output {
+      min-width: 56px;
+      text-align: center;
+      font-size: .82rem;
+      color: var(--muted);
+    }
+
+    .scan-stage {
+      width: 100%;
+      height: min(65dvh, 680px);
+      min-height: 220px;
+      overflow: auto;
+      overscroll-behavior: contain;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--soft);
+      padding: 10px;
+      touch-action: pan-x pan-y pinch-zoom;
+    }
+    .scan-canvas {
+      position: relative;
+      margin: 0 auto;
+    }
+    .scan-canvas img {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      max-width: none;
+      display: block;
+      user-select: none;
+      -webkit-user-drag: none;
+      background: #fff;
+    }
+
+    .local-video {
+      display: block;
+      width: 100%;
+      max-height: 66dvh;
+      background: #101318;
+      border-radius: 14px;
+    }
+
+    .document-source,
+    .document-preview {
+      max-height: 65dvh;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--bg);
+      padding: 18px;
+      color: var(--ink);
+      overflow-wrap: anywhere;
+    }
+    .document-source {
+      margin: 0;
+      white-space: pre-wrap;
+      tab-size: 4;
+      font: .9rem/1.85 ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+    .document-preview {
+      line-height: 1.85;
+    }
+    .document-preview h1,
+    .document-preview h2,
+    .document-preview h3 {
+      margin: 1.1em 0 .5em;
+      line-height: 1.4;
+    }
+    .document-preview h1 { font-size: 1.55rem; }
+    .document-preview h2 { font-size: 1.3rem; }
+    .document-preview h3 { font-size: 1.1rem; }
+    .document-preview p { white-space: pre-wrap; }
+    .document-preview pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      padding: 12px;
+      background: var(--soft);
+      border-radius: 10px;
+    }
+    .document-preview blockquote {
+      margin-inline: 0;
+      padding-inline-start: 14px;
+      border-inline-start: 3px solid var(--accent);
+      color: var(--muted);
+    }
+    .document-preview ul,
+    .document-preview ol {
+      padding-inline-start: 1.6rem;
+    }
+  `;
+  document.head.append(style);
+
+  /* =========================================================
+     2. 종류·입력·검증 확장
+     ========================================================= */
+
+  const EXTRA = ["video", "image", "txt", "md"];
+
+  Object.assign(KIND, {
+    video: "기기 영상",
+    image: "이미지 악보",
+    txt: "TXT 문서",
+    md: "Markdown"
+  });
+
+  for (const kind of EXTRA) {
+    if (![...$("f-kind").options].some(o => o.value === kind)) {
+      const option = document.createElement("option");
+      option.value = kind;
+      option.textContent = KIND[kind];
+      $("f-kind").append(option);
+    }
+  }
+
+  const LIMIT = {
+    video: 256 * 1024 * 1024,
+    image: 20 * 1024 * 1024,
+    txt: 2 * 1024 * 1024,
+    md: 2 * 1024 * 1024
+  };
+
+  const ACCEPT = {
+    pdf: ".pdf,application/pdf",
+    audio: "audio/*,.mp3,.wav,.m4a,.aac,.flac,.ogg,.opus",
+    video: "video/*,.mp4,.m4v,.webm,.mov,.ogv",
+    image: ".jpg,.jpeg,.png,.webp,.gif,image/jpeg,image/png,image/webp,image/gif",
+    txt: ".txt,text/plain",
+    md: ".md,.markdown,text/markdown"
+  };
+
+  const HELP = {
+    pdf: "PDF 최대 30MiB",
+    audio: "음원 최대 60MiB",
+    video: "영상 최대 256MiB · 재생 가능 여부는 브라우저 코덱 지원에 따릅니다.",
+    image: "JPG·PNG·WebP·GIF 최대 20MiB",
+    txt: "UTF-8 TXT 최대 2MiB",
+    md: "UTF-8 Markdown 최대 2MiB"
+  };
+
+  /*
+   * 기존 스키마의 필드·버전·길이·중복 ID·주소 검증을 재사용합니다.
+   * 새로운 파일 종류만 기존 파일 자료와 동일한 구조로 검증한 뒤 복원합니다.
+   */
+  const originalValidate = validate;
+
+  validate = function(data) {
+    const candidate = copy(data);
+
+    if (Array.isArray(candidate?.items)) {
+      candidate.items = candidate.items.map(item => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) {
+          return item;
+        }
+        return {
+          ...item,
+          kind: EXTRA.includes(item.kind) ? "audio" : item.kind
+        };
+      });
+    }
+
+    const result = originalValidate(candidate);
+
+    result.items.forEach((item, index) => {
+      const kind = data.items[index].kind;
+      if (EXTRA.includes(kind)) item.kind = kind;
+    });
+
+    return result;
+  };
+
+  function decodeUTF8(buffer) {
+    let text;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+    } catch {
+      throw Error(
+        "UTF-8 문서가 아닙니다. 텍스트 편집기에서 UTF-8로 저장한 뒤 다시 선택하세요."
+      );
+    }
+    if (text.includes("\u0000")) {
+      throw Error("텍스트가 아닌 바이너리 데이터가 포함되어 있습니다.");
+    }
+    return text;
+  }
+
+  const originalCheckFile = checkFile;
+
+  checkFile = async function(file, kind) {
+    if (!EXTRA.includes(kind)) {
+      return originalCheckFile(file, kind);
+    }
+
+    if (!(file instanceof Blob) || file.size === 0) {
+      throw Error("비어 있거나 읽을 수 없는 파일입니다.");
+    }
+    if (file.size > LIMIT[kind]) {
+      throw Error(HELP[kind]);
+    }
+
+    if (kind === "txt" || kind === "md") {
+      decodeUTF8(await file.arrayBuffer());
+      return;
+    }
+
+    const head = new Uint8Array(
+      await file.slice(0, 32).arrayBuffer()
+    );
+    const ascii = (start, end) =>
+      String.fromCharCode(...head.slice(start, end));
+
+    if (kind === "image") {
+      const jpeg =
+        head === 0xff && head === 0xd8 && head === 0xff;
+      const png =
+        [137, 80, 78, 71, 13, 10, 26, 10]
+          .every((value, index) => head[index] === value);
+      const gif =
+        ["GIF87a", "GIF89a"].includes(ascii(0, 6));
+      const webp =
+        ascii(0, 4) === "RIFF" && ascii(8, 12) === "WEBP";
+
+      if (!(jpeg || png || gif || webp)) {
+        throw Error(
+          "JPG·PNG·WebP·GIF 이미지로 선택하세요. HEIC·TIFF·SVG는 변환 후 이용하세요."
+        );
+      }
+      return;
+    }
+
+    if (kind === "video") {
+      const mp4OrMov = ascii(4, 8) === "ftyp";
+      const webm =
+        head === 0x1a && head === 0x45 &&
+        head[1] === 0xdf && head === 0xa3;
+      const ogg = ascii(0, 4) === "OggS";
+
+      if (!(mp4OrMov || webm || ogg)) {
+        throw Error(
+          "지원하는 영상 컨테이너를 확인할 수 없습니다. MP4 또는 WebM으로 변환해 주세요."
+        );
+      }
+    }
+  };
+
+  fields = function() {
+    const kind = $("f-kind").value;
+    const fileKind = [
+      "pdf", "audio", "video", "image", "txt", "md"
+    ].includes(kind);
+
+    if (!fileKind) $("f-source").value = "url";
+
+    const local = fileKind && $("f-source").value === "local";
+
+    $("source-field").hidden = !fileKind;
+    $("url-field").hidden = kind === "note" || local;
+    $("file-field").hidden = !local;
+    $("text-field").hidden = kind !== "note";
+
+    $("f-url").required = kind !== "note" && !local;
+    $("f-text").required = kind === "note";
+    $("f-file").accept = ACCEPT[kind] || "";
+
+    const old = state.items.find(item => item.id === editingId);
+    const currentFile =
+      old?.source === "local" && old.kind === kind
+        ? `현재: ${old.fileName} · `
+        : "";
+
+    $("file-help").textContent = currentFile + (HELP[kind] || "");
+  };
+
+  $("f-source").onchange = fields;
+
+  $("f-kind").onchange = () => {
+    $("f-file").value = "";
+
+    const defaultIcons = {
+      pdf: "score",
+      audio: "headphones",
+      youtube: "video",
+      note: "note",
+      link: "note",
+      video: "video",
+      image: "score",
+      txt: "note",
+      md: "note"
+    };
+
+    $("f-icon").value = defaultIcons[$("f-kind").value] || "note";
+    fields();
+  };
+
+  const originalDrawDetail = drawDetail;
+
+  drawDetail = function() {
+    originalDrawDetail();
+
+    const item = current();
+    if (!item) return;
+
+    const labels = {
+      video: "영상 재생",
+      image: "이미지 악보 보기",
+      txt: "TXT 문서 보기",
+      md: "Markdown 보기"
+    };
+
+    if (labels[item.kind]) {
+      $("open").textContent = labels[item.kind];
+    }
+  };
+
+  /* =========================================================
+     3. 다이얼 복구
+     - 선택할 때마다 DOM 재생성하지 않음
+     - requestAnimationFrame 기반 부드러운 정렬
+     - 드래그 중 실시간 회전
+     - 아이콘 역회전으로 정방향 유지
+     - 휠·터치·마우스·키보드
+     ========================================================= */
+
+  /*
+   * 기존 익명 pointer/wheel 이벤트를 제거하기 위해
+   * 다이얼 컨테이너만 복제합니다. 다른 앱 이벤트는 유지합니다.
+   */
+  const oldDial = $("dial");
+  const dial = oldDial.cloneNode(true);
+  oldDial.replaceWith(dial);
+
+  dial.querySelectorAll(".node").forEach(node => node.remove());
+
+  const orbit = document.createElement("div");
+  orbit.className = "music-orbit";
+  dial.prepend(orbit);
+
+  let group = [];
+  let groupKey = "";
+  let angle = 0;
+  let target = 0;
+  let animation = 0;
+  let paintFrame = 0;
+  let lastFrameTime = 0;
+  let pointer = null;
+  let ignoreClickUntil = 0;
+  let lastWheel = 0;
+
+  const reducedMotion =
+    window.matchMedia("(prefers-reduced-motion: reduce)");
+
+  const normalizeAngle = value =>
+    ((value + 180) % 360 + 360) % 360 - 180;
+
+  function stopAnimation() {
+    cancelAnimationFrame(animation);
+    animation = 0;
+    lastFrameTime = 0;
+  }
+
+  function paint() {
+    orbit.style.transform = `rotate(${angle}deg)`;
+
+    orbit.querySelectorAll(".dial-glyph").forEach(node => {
+      node.style.transform = `rotate(${-angle}deg)`;
+    });
+  }
+
+  function queuePaint() {
+    if (paintFrame) return;
+
+    paintFrame = requestAnimationFrame(() => {
+      paintFrame = 0;
+      paint();
+    });
+  }
+
+  function animate(time) {
+    animation = 0;
+    if (pointer) return;
+
+    const difference = target - angle;
+
+    if (Math.abs(difference) < 0.06) {
+      angle = target;
+      paint();
+      return;
+    }
+
+    const elapsed = lastFrameTime
+      ? Math.min(40, time - lastFrameTime)
+      : 16;
+
+    lastFrameTime = time;
+    angle += difference * (1 - Math.exp(-elapsed / 65));
+    paint();
+
+    animation = requestAnimationFrame(animate);
+  }
+
+  function settle(degrees) {
+    target = angle + normalizeAngle(degrees - angle);
+
+    if (reducedMotion.matches) {
+      stopAnimation();
+      angle = target;
+      paint();
+      return;
+    }
+
+    if (!animation) {
+      lastFrameTime = 0;
+      animation = requestAnimationFrame(animate);
+    }
+  }
+
+  function releasePointer() {
+    if (!pointer) return;
+
+    const id = pointer.id;
+    pointer = null;
+    dial.classList.remove("is-dragging");
+
+    if (dial.hasPointerCapture(id)) {
+      dial.releasePointerCapture(id);
+    }
+  }
+
+  drawDial = function() {
+    if (!visible.length) {
+      stopAnimation();
+      releasePointer();
+      orbit.replaceChildren();
+      group = [];
+      groupKey = "";
+      return;
+    }
+
+    const index = Math.max(
+      0, visible.findIndex(item => item.id === selectedId)
+    );
+    const start = Math.floor(index / 8) * 8;
+    const nextGroup = visible.slice(start, start + 8);
+    const localIndex = index - start;
+    const step = 360 / nextGroup.length;
+
+    const nextKey = JSON.stringify(
+      nextGroup.map(item => [item.id, item.icon, item.title])
+    );
+
+    if (nextKey !== groupKey) {
+      stopAnimation();
+      releasePointer();
+      cancelAnimationFrame(paintFrame);
+      paintFrame = 0;
+
+      group = nextGroup;
+      groupKey = nextKey;
+      orbit.replaceChildren();
+
+      group.forEach((item, slot) => {
+        const radians = (slot * step - 90) * Math.PI / 180;
+
+        const node = document.createElement("button");
+        node.type = "button";
+        node.className = "node";
+        node.dataset.id = item.id;
+        node.title = item.title;
+        node.setAttribute("aria-label", item.title);
+
+        node.style.left = `${50 + 38 * Math.cos(radians)}%`;
+        node.style.top = `${50 + 38 * Math.sin(radians)}%`;
+
+        const glyph = document.createElement("span");
+        glyph.className = "dial-glyph";
+        glyph.append(svg(item.icon));
+        node.append(glyph);
+
+        node.addEventListener("click", event => {
+          /*
+           * 포인터 클릭은 pointerup에서 처리합니다.
+           * 키보드 Enter/Space 및 보조기술의 click은 허용합니다.
+           */
+          if (
+            event.detail === 0 ||
+            performance.now() >= ignoreClickUntil
+          ) {
+            select(item.id, true);
+          }
+        });
+
+        orbit.append(node);
+      });
+
+      angle = target = -localIndex * step;
+      paint();
+    } else if (!pointer) {
+      settle(-localIndex * step);
+    }
+
+    orbit.querySelectorAll(".node").forEach(node => {
+      const active = node.dataset.id === selectedId;
+      node.setAttribute("aria-pressed", String(active));
+      node.tabIndex = active ? 0 : -1;
+    });
+
+    const item = visible[index];
+
+    $("center-icon").replaceChildren(svg(item.icon));
+    $("center-count").textContent =
+      `${String(index + 1).padStart(2, "0")} / ` +
+      `${String(visible.length).padStart(2, "0")}`;
+
+    $("position").textContent = `${index + 1} / ${visible.length}`;
+    $("prev").disabled = $("next").disabled = visible.length < 2;
+  };
+
+  function pointerPosition(event) {
+    const box = dial.getBoundingClientRect();
+    const x = event.clientX - box.left - box.width / 2;
+    const y = event.clientY - box.top - box.height / 2;
+
+    return {
+      angle: Math.atan2(y, x) * 180 / Math.PI,
+      radius: Math.hypot(x, y)
+    };
+  }
+
+  dial.addEventListener("pointerdown", event => {
+    if (
+      event.button !== 0 ||
+      event.isPrimary === false ||
+      pointer ||
+      !group.length
+    ) return;
+
+    const position = pointerPosition(event);
+    if (position.radius < 28) return;
+
+    event.preventDefault();
+    stopAnimation();
+
+    const clickedNode = event.target.closest(".node");
+    clickedNode?.focus({ preventScroll: true });
+
+    pointer = {
+      id: event.pointerId,
+      last: position.angle,
+      time: performance.now(),
+      total: 0,
+      velocity: 0,
+      moved: false,
+      clickedId: clickedNode?.dataset.id || ""
+    };
+
+    dial.setPointerCapture(event.pointerId);
+    dial.classList.add("is-dragging");
+  });
+
+  dial.addEventListener("pointermove", event => {
+    if (!pointer || pointer.id !== event.pointerId) return;
+
+    const position = pointerPosition(event);
+
+    if (position.radius < 28) {
+      pointer.last = position.angle;
+      pointer.velocity = 0;
+      return;
+    }
+
+    const now = performance.now();
+    const delta = normalizeAngle(position.angle - pointer.last);
+    const elapsed = Math.max(8, now - pointer.time);
+
+    pointer.last = position.angle;
+    pointer.time = now;
+    pointer.total += delta;
+    pointer.velocity =
+      pointer.velocity * 0.65 + (delta / elapsed) * 0.35;
+
+    if (Math.abs(pointer.total) > 4) pointer.moved = true;
+
+    angle += delta;
+    target = angle;
+    queuePaint();
+  });
+
+  function finishPointer(event, cancelled = false) {
+    if (!pointer || pointer.id !== event.pointerId) return;
+
+    const finished = pointer;
+    releasePointer();
+
+    cancelAnimationFrame(paintFrame);
+    paintFrame = 0;
+    paint();
+
+    ignoreClickUntil = performance.now() + 450;
+
+    if (cancelled) {
+      drawDial();
+      return;
+    }
+
+    if (!finished.moved) {
+      if (finished.clickedId) {
+        select(finished.clickedId, true);
+      } else {
+        drawDial();
+      }
+      return;
+    }
+
+    const step = 360 / group.length;
+
+    /*
+     * 손을 멈춘 후 놓았다면 과거 속도로 튀지 않게 합니다.
+     * 짧은 관성 투영 후 가장 가까운 항목에 부드럽게 정렬합니다.
+     */
+    const freshVelocity =
+      performance.now() - finished.time < 100
+        ? finished.velocity
+        : 0;
+
+    const momentum = Math.max(
+      -step * 0.75,
+      Math.min(step * 0.75, freshVelocity * 100)
+    );
+
+    const projected = angle + momentum;
+    const slot =
+      ((Math.round(-projected / step) % group.length) +
+        group.length) % group.length;
+
+    select(group[slot].id, true);
+  }
+
+  dial.addEventListener("pointerup", event => finishPointer(event));
+  dial.addEventListener("pointercancel", event => finishPointer(event, true));
+  dial.addEventListener("lostpointercapture", event => {
+    if (pointer?.id === event.pointerId) {
+      finishPointer(event, true);
+    }
+  });
+
+  dial.addEventListener("wheel", event => {
+    if (visible.length < 2 || pointer) return;
+
+    const delta =
+      Math.abs(event.deltaY) >= Math.abs(event.deltaX)
+        ? event.deltaY
+        : event.deltaX;
+
+    if (!delta) return;
+
+    event.preventDefault();
+
+    const now = performance.now();
+    if (now - lastWheel < 160) return;
+
+    lastWheel = now;
+    move(delta > 0 ? 1 : -1);
+  }, { passive: false });
+
+  dial.addEventListener("keydown", event => {
+    const directions = {
+      ArrowRight: 1,
+      ArrowDown: 1,
+      ArrowLeft: -1,
+      ArrowUp: -1
+    };
+
+    if (Object.hasOwn(directions, event.key)) {
+      event.preventDefault();
+      move(directions[event.key], true);
+    } else if (
+      visible.length &&
+      ["Home", "End"].includes(event.key)
+    ) {
+      event.preventDefault();
+      const index = event.key === "Home" ? 0 : visible.length - 1;
+      select(visible[index].id, true);
+    }
+  });
+
+  /* =========================================================
+     4. 확장 자료 로딩과 모달 정리
+     ========================================================= */
+
+  let disposeExtra = () => {};
+
+  function cleanupExtra() {
+    disposeExtra();
+    disposeExtra = () => {};
+  }
+
+  const originalClearViewer = clearViewer;
+
+  clearViewer = function() {
+    cleanupExtra();
+    originalClearViewer();
+  };
+
+  /*
+   * 기존 close 이벤트에는 기존 함수 객체가 연결되어 있으므로
+   * 확장 뷰어의 observer 정리도 별도로 연결합니다.
+   */
+  $("viewer").addEventListener("close", cleanupExtra);
+
+  async function fetchLimitedFile(item, signal) {
+    const response = await fetch(safeURL(item.url), {
+      signal,
+      credentials: "omit"
+    });
+
+    if (!response.ok) {
+      throw Error(`자료 서버 응답 오류: ${response.status}`);
+    }
+
+    const max = LIMIT[item.kind];
+    const size = Number(response.headers.get("content-length"));
+
+    if (Number.isFinite(size) && size > max) {
+      throw Error(HELP[item.kind]);
+    }
+
+    const reader = response.body?.getReader();
+    let blob;
+
+    if (reader) {
+      const parts = [];
+      let total = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        total += value.byteLength;
+
+        if (total > max) {
+          await reader.cancel();
+          throw Error(HELP[item.kind]);
+        }
+
+        parts.push(value);
+      }
+
+      blob = new Blob(parts, {
+        type: response.headers.get("content-type") || ""
+      });
+    } else {
+      blob = await response.blob();
+    }
+
+    await checkFile(blob, item.kind);
+    return blob;
+  }
+
+  async function loadDocumentFile(item) {
+    if (item.source === "local") {
+      return resolveLocal(item);
+    }
+
+    fetchController = new AbortController();
+
+    return fetchLimitedFile(
+      item,
+      fetchController.signal
+    );
+  }
+
+  /* =========================================================
+     5. 스캔 이미지 악보 — 확대·축소·회전·너비 맞춤
+     ========================================================= */
+
+  function showImage(file, item, token) {
+    const toolbar = el("div", "extended-toolbar");
+    const stage = el("div", "scan-stage");
+    const canvas = el("div", "scan-canvas");
+    const image = document.createElement("img");
+    const zoomOutput = document.createElement("output");
+
+    image.alt = item.title;
+    image.draggable = false;
+
+    let zoom = 1;
+    let rotation = 0;
+
+    function layout() {
+      if (
+        token !== viewerToken ||
+        !image.naturalWidth ||
+        !stage.isConnected
+      ) return;
+
+      const turned = rotation % 180 !== 0;
+      const naturalWidth = turned
+        ? image.naturalHeight
+        : image.naturalWidth;
+      const naturalHeight = turned
+        ? image.naturalWidth
+        : image.naturalHeight;
+
+      const available = Math.max(1, stage.clientWidth - 24);
+      const fitted = Math.min(1, available / naturalWidth);
+      const scale = fitted * zoom;
+
+      canvas.style.width = `${naturalWidth * scale}px`;
+      canvas.style.height = `${naturalHeight * scale}px`;
+
+      image.style.width = `${image.naturalWidth * scale}px`;
+      image.style.height = `${image.naturalHeight * scale}px`;
+      image.style.transform =
+        `translate(-50%, -50%) rotate(${rotation}deg)`;
+
+      zoomOutput.textContent = `${Math.round(zoom * 100)}%`;
+      zoomOutput.setAttribute(
+        "aria-label",
+        `너비 맞춤 기준 확대 ${Math.round(zoom * 100)}퍼센트`
+      );
+    }
+
+    function changeZoom(factor) {
+      zoom = Math.max(0.5, Math.min(5, zoom * factor));
+      layout();
+    }
+
+    const smaller = button("−", () => changeZoom(1 / 1.25));
+    const larger = button("＋", () => changeZoom(1.25));
+
+    smaller.setAttribute("aria-label", "악보 축소");
+    larger.setAttribute("aria-label", "악보 확대");
+
+    toolbar.append(
+      smaller,
+      zoomOutput,
+      larger,
+      button("너비 맞춤", () => {
+        zoom = 1;
+        layout();
+        stage.scrollTo({ top: 0, left: 0 });
+      }),
+      button("90° 회전", () => {
+        rotation = (rotation + 90) % 360;
+        layout();
+      })
+    );
+
+    canvas.append(image);
+    stage.append(canvas);
+    $("viewer-body").append(toolbar, stage);
+
+    let observer = null;
+
+    if ("ResizeObserver" in window) {
+      observer = new ResizeObserver(layout);
+      observer.observe(stage);
+    }
+
+    disposeExtra = () => {
+      observer?.disconnect();
+      image.onload = null;
+      image.onerror = null;
+    };
+
+    image.onload = () => {
+      if (token !== viewerToken) return;
+      layout();
+      $("viewer-status").textContent =
+        "확대한 악보는 화면을 밀거나 스크롤해 이동하세요. 이미지의 문자인식(OCR)은 수행하지 않습니다.";
+    };
+
+    image.onerror = () => {
+      if (token !== viewerToken) return;
+      $("viewer-status").textContent =
+        "이미지를 해석하지 못했습니다. 다른 이미지 편집기에서 JPG 또는 PNG로 다시 저장해 주세요.";
+    };
+
+    const url = blobURL(file);
+    externalLink(url);
+    image.src = url;
+  }
+
+  /* =========================================================
+     6. TXT / Markdown
+     - HTML 삽입 없음
+     - 제목·목록·인용·코드 블록 기본 미리보기
+     - 문서 내부 HTML·스크립트·외부 이미지를 실행하지 않음
+     ========================================================= */
+
+  function markdownPreview(text) {
+    const root = el("div", "document-preview");
+    const allLines = text.replace(/\r\n?/g, "\n").split("\n");
+    const lines = allLines.slice(0, 5000);
+
+    let paragraph = [];
+    let code = [];
+    let fence = "";
+    let list = null;
+    let listType = "";
+
+    function flushParagraph() {
+      if (paragraph.length) {
+        root.append(el("p", "", paragraph.join("\n")));
+        paragraph = [];
+      }
+    }
+
+    function closeList() {
+      list = null;
+      listType = "";
+    }
+
+    for (const line of lines) {
+      const fenceMatch = line.match(/^\s*(`{3,}|~{3,})/);
+
+      if (fence) {
+        if (
+          fenceMatch &&
+          fenceMatch[1] === fence &&
+          fenceMatch[1].length >= fence.length
+        ) {
+          const pre = document.createElement("pre");
+          pre.append(el("code", "", code.join("\n")));
+          root.append(pre);
+          code = [];
+          fence = "";
+        } else {
+          code.push(line);
+        }
+        continue;
+      }
+
+      if (fenceMatch) {
+        flushParagraph();
+        closeList();
+        fence = fenceMatch[1];
+        continue;
+      }
+
+      if (!line.trim()) {
+        flushParagraph();
+        closeList();
+        continue;
+      }
+
+      const heading = line.match(/^(#{1,6})\s+(.+)$/);
+
+      if (heading) {
+        flushParagraph();
+        closeList();
+        root.append(
+          el(`h${heading[1].length}`, "", heading[1])
+        );
+        continue;
+      }
+
+      const quote = line.match(/^\s*>\s?(.*)$/);
+
+      if (quote) {
+        flushParagraph();
+        closeList();
+        root.append(el("blockquote", "", quote[1]));
+        continue;
+      }
+
+      const unordered = line.match(/^\s*[-+*]\s+(.+)$/);
+      const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
+
+      if (unordered || ordered) {
+        flushParagraph();
+        const type = ordered ? "ol" : "ul";
+
+        if (!list || type !== listType) {
+          list = document.createElement(type);
+          listType = type;
+          root.append(list);
+        }
+
+        list.append(
+          el("li", "", (ordered || unordered)[1])
+        );
+        continue;
+      }
+
+      closeList();
+      paragraph.push(line);
+    }
+
+    flushParagraph();
+
+    if (fence) {
+      const pre = document.createElement("pre");
+      pre.append(el("code", "", code.join("\n")));
+      root.append(pre);
+    }
+
+    if (allLines.length > lines.length) {
+      root.append(
+        el(
+          "p",
+          "muted",
+          "미리보기는 처음 5,000줄까지 표시합니다. 전체 내용은 원문 보기에서 확인하세요."
+        )
+      );
+    }
+
+    return root;
+  }
+
+  function showText(text, kind) {
+    const source = el("pre", "document-source", text);
+
+    if (kind === "txt") {
+      $("viewer-body").append(source);
+      $("viewer-status").textContent = "UTF-8 텍스트 문서";
+      return;
+    }
+
+    const toolbar = el("div", "extended-toolbar");
+    const content = el("div");
+    const preview = markdownPreview(text);
+
+    const previewButton = button("기본 미리보기", () => {
+      source.hidden = true;
+      preview.hidden = false;
+      previewButton.setAttribute("aria-pressed", "true");
+      sourceButton.setAttribute("aria-pressed", "false");
+    });
+
+    const sourceButton = button("원문 보기", () => {
+      source.hidden = false;
+      preview.hidden = true;
+      previewButton.setAttribute("aria-pressed", "false");
+      sourceButton.setAttribute("aria-pressed", "true");
+    });
+
+    previewButton.setAttribute("aria-pressed", "true");
+    sourceButton.setAttribute("aria-pressed", "false");
+    source.hidden = true;
+
+    toolbar.append(previewButton, sourceButton);
+    content.append(preview, source);
+    $("viewer-body").append(toolbar, content);
+
+    $("viewer-status").textContent =
+      "제목·목록·인용·코드 블록을 표시합니다. 문서의 HTML과 스크립트는 실행하지 않으며 외부 이미지는 불러오지 않습니다.";
+  }
+
+  /* =========================================================
+     7. 영상 / 이미지 / 문서 열기
+     ========================================================= */
+
+  const originalOpenItem = openItem;
+
+  openItem = async function(item) {
+    if (!item || !EXTRA.includes(item.kind)) {
+      return originalOpenItem(item);
+    }
+
+    clearViewer();
+    const token = viewerToken;
+
+    $("viewer-title").textContent = item.title;
+    $("viewer").classList.remove("pdf-view");
+    $("viewer-status").textContent = "자료를 불러오는 중…";
+    $("viewer").showModal();
+
+    if (item.source === "url") {
+      externalLink(safeURL(item.url));
+    }
+
+    try {
+      if (item.kind === "video") {
+        const source = item.source === "local"
+          ? await resolveLocal(item)
+          : safeURL(item.url);
+
+        if (token !== viewerToken) return;
+
+        const video = document.createElement("video");
+        video.className = "local-video";
+        video.controls = true;
+        video.playsInline = true;
+        video.preload = "metadata";
+        video.setAttribute("aria-label", item.title);
+
+        video.src = typeof source === "string"
+          ? source
+          : blobURL(source);
+
+        /*
+         * 기존 재생·일시정지·정지 버튼과 모달 종료 정리를 재사용합니다.
+         * HTMLVideoElement도 HTMLMediaElement 인터페이스를 지원합니다.
+         */
+        media = video;
+
+        video.addEventListener("loadedmetadata", () => {
+          if (token !== viewerToken) return;
+          $("viewer-status").textContent =
+            "재생 버튼을 누르면 시작합니다. 재생창을 닫으면 영상도 종료됩니다.";
+        });
+
+        video.addEventListener("error", () => {
+          if (token !== viewerToken) return;
+          $("viewer-status").textContent =
+            "영상을 재생하지 못했습니다. 주소·접근 권한·코덱을 확인하세요. 호환성을 위해 H.264/AAC MP4를 권장합니다.";
+        });
+
+        $("viewer-body").append(video);
+        $("media-actions").hidden = false;
+        $("viewer-status").textContent =
+          "재생 버튼을 누르면 시작합니다.";
+        return;
+      }
+
+      const file = await loadDocumentFile(item);
+      if (token !== viewerToken) return;
+
+      if (item.kind === "image") {
+        showImage(file, item, token);
+        return;
+      }
+
+      const text = decodeUTF8(await file.arrayBuffer());
+      if (token !== viewerToken) return;
+
+      showText(text, item.kind);
+    } catch (error) {
+      if (
+        token !== viewerToken ||
+        error.name === "AbortError"
+      ) return;
+
+      $("viewer-status").textContent =
+        (error.message || "자료를 읽지 못했습니다.") +
+        (item.source === "url"
+          ? " 외부 주소 자료는 서버의 CORS 허용이 필요할 수 있습니다."
+          : "");
+    }
+  };
+
+  /*
+   * 기존 초기 로딩 단계에서 확장 종류를 인식하지 못했을 수 있으므로
+   * 확장 검증기가 준비된 이후 저장 기록을 다시 읽습니다.
+   * 저장 기록을 삭제하거나 기본값으로 덮어쓰지 않습니다.
+   */
+  load();
+  route();
+})();
+</script>
+
 </body>
 </html>
